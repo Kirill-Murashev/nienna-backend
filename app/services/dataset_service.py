@@ -642,6 +642,106 @@ class DatasetService:
             "metrics": metrics,
         }
 
+    def get_correlation_lab(
+        self,
+        year: int,
+        object_level: str,
+        x_indicator: dict[str, Any],
+        y_indicator: dict[str, Any],
+    ) -> dict[str, Any]:
+        x_filters = ["indicator_code = ?", "year = ?", "object_level = ?"]
+        x_params: list[Any] = [x_indicator["code"], year, object_level]
+        if x_indicator.get("subsection"):
+            x_filters.append("subsection = ?")
+            x_params.append(x_indicator["subsection"])
+
+        y_filters = ["indicator_code = ?", "year = ?", "object_level = ?"]
+        y_params: list[Any] = [y_indicator["code"], year, object_level]
+        if y_indicator.get("subsection"):
+            y_filters.append("subsection = ?")
+            y_params.append(y_indicator["subsection"])
+
+        points = self._query(
+            f"""
+            WITH x AS (
+              SELECT object_name, indicator_name, subsection, indicator_value, indicator_unit, source
+              FROM observations
+              WHERE {' AND '.join(x_filters)}
+                AND indicator_value NOT IN ({MISSING_VALUE_SENTINELS[0]}, {MISSING_VALUE_SENTINELS[1]})
+            ),
+            y AS (
+              SELECT object_name, indicator_name, subsection, indicator_value, indicator_unit, source
+              FROM observations
+              WHERE {' AND '.join(y_filters)}
+                AND indicator_value NOT IN ({MISSING_VALUE_SENTINELS[0]}, {MISSING_VALUE_SENTINELS[1]})
+            )
+            SELECT
+              x.object_name,
+              x.indicator_name AS x_indicator_name,
+              x.subsection AS x_subsection,
+              x.indicator_value AS x_value,
+              x.indicator_unit AS x_unit,
+              x.source AS x_source,
+              y.indicator_name AS y_indicator_name,
+              y.subsection AS y_subsection,
+              y.indicator_value AS y_value,
+              y.indicator_unit AS y_unit,
+              y.source AS y_source
+            FROM x
+            INNER JOIN y USING (object_name)
+            ORDER BY x.indicator_value DESC
+            """,
+            x_params + y_params,
+        )
+
+        summary = self._query_one(
+            f"""
+            WITH x AS (
+              SELECT object_name, indicator_value
+              FROM observations
+              WHERE {' AND '.join(x_filters)}
+                AND indicator_value NOT IN ({MISSING_VALUE_SENTINELS[0]}, {MISSING_VALUE_SENTINELS[1]})
+            ),
+            y AS (
+              SELECT object_name, indicator_value
+              FROM observations
+              WHERE {' AND '.join(y_filters)}
+                AND indicator_value NOT IN ({MISSING_VALUE_SENTINELS[0]}, {MISSING_VALUE_SENTINELS[1]})
+            )
+            SELECT
+              count(*) AS observations_count,
+              corr(x.indicator_value, y.indicator_value) AS pearson_correlation,
+              avg(x.indicator_value) AS x_avg,
+              avg(y.indicator_value) AS y_avg
+            FROM x
+            INNER JOIN y USING (object_name)
+            """,
+            x_params + y_params,
+        )
+
+        strongest_positive = sorted(
+            points,
+            key=lambda item: (item["x_value"] - (summary.get("x_avg") or 0.0))
+            * (item["y_value"] - (summary.get("y_avg") or 0.0)),
+            reverse=True,
+        )[:8]
+        strongest_divergence = sorted(
+            points,
+            key=lambda item: abs((item["x_value"] - (summary.get("x_avg") or 0.0)) - (item["y_value"] - (summary.get("y_avg") or 0.0))),
+            reverse=True,
+        )[:8]
+
+        return {
+            "year": year,
+            "object_level": object_level,
+            "summary": summary,
+            "x_indicator": x_indicator,
+            "y_indicator": y_indicator,
+            "points": points,
+            "strongest_positive": strongest_positive,
+            "strongest_divergence": strongest_divergence,
+        }
+
 
 @lru_cache(maxsize=1)
 def get_dataset_service() -> DatasetService:

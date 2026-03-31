@@ -30,3 +30,20 @@ def test_region_profile_smoke() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["overview_cards"]
+
+
+def test_correlation_lab_smoke() -> None:
+    client = TestClient(app)
+    response = client.post(
+        "/api/v1/nienna/correlation",
+        json={
+            "year": 2024,
+            "object_level": "Регион",
+            "x_indicator": {"code": "Y477110108"},
+            "y_indicator": {"code": "Y477110374"},
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["summary"]["observations_count"] > 0
+    assert payload["points"]

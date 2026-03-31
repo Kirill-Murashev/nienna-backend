@@ -28,6 +28,13 @@ class CompareRegionsPayload(BaseModel):
     indicators: list[CompareIndicatorPayload] = Field(default_factory=list)
 
 
+class CorrelationLabPayload(BaseModel):
+    year: int
+    object_level: str = "Регион"
+    x_indicator: CompareIndicatorPayload
+    y_indicator: CompareIndicatorPayload
+
+
 @router.get("")
 def get_service_overview() -> dict[str, object]:
     return {
@@ -144,3 +151,16 @@ def get_theme_dashboard(
     service: DatasetService = Depends(get_dataset_service),
 ) -> dict[str, Any]:
     return service.get_theme_dashboard(theme_id=theme_id, year=year, object_name=object_name)
+
+
+@router.post("/correlation")
+def get_correlation_lab(
+    payload: CorrelationLabPayload,
+    service: DatasetService = Depends(get_dataset_service),
+) -> dict[str, Any]:
+    return service.get_correlation_lab(
+        year=payload.year,
+        object_level=payload.object_level,
+        x_indicator=payload.x_indicator.model_dump(),
+        y_indicator=payload.y_indicator.model_dump(),
+    )
