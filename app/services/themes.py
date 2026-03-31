@@ -105,6 +105,54 @@ PROFILE_HERO_INDICATORS = [
     {"code": "Y477110108", "title": "Инвестиции на душу населения"},
 ]
 
+MODELING_PRESETS = [
+    {
+        "id": "income_growth",
+        "title": "Доходы населения",
+        "description": "Доходы как функция зарплат, инвестиций и демографической базы.",
+        "dependent_indicator": {"code": "Y477110374", "transform": "log"},
+        "predictor_indicators": [
+            {"code": "Y477130013", "transform": "log"},
+            {"code": "Y477110108", "transform": "log", "lag_years": 1},
+            {"code": "Y477110461", "transform": "log"},
+        ],
+        "include_year_fixed_effects": True,
+        "include_object_fixed_effects": True,
+        "year_from": 2015,
+        "year_to": 2024,
+    },
+    {
+        "id": "labor_market",
+        "title": "Рынок труда",
+        "description": "Безработица как функция доходов, зарплат и структуры населения.",
+        "dependent_indicator": {"code": "Y477100008", "transform": "raw"},
+        "predictor_indicators": [
+            {"code": "Y477110374", "transform": "log"},
+            {"code": "Y477130013", "transform": "log"},
+            {"code": "Y477110470", "transform": "raw"},
+        ],
+        "include_year_fixed_effects": True,
+        "include_object_fixed_effects": True,
+        "year_from": 2012,
+        "year_to": 2024,
+    },
+    {
+        "id": "housing_prices",
+        "title": "Цены на жильё",
+        "description": "Цены на вторичке как функция доходов, ввода жилья и населения.",
+        "dependent_indicator": {"code": "Y477190015", "transform": "log"},
+        "predictor_indicators": [
+            {"code": "Y477110374", "transform": "log"},
+            {"code": "Y477110017", "transform": "log", "lag_years": 1},
+            {"code": "Y477110461", "transform": "log"},
+        ],
+        "include_year_fixed_effects": True,
+        "include_object_fixed_effects": False,
+        "year_from": 2011,
+        "year_to": 2024,
+    },
+]
+
 
 def theme_codes(theme_id: str) -> list[str]:
     for theme in THEME_DEFINITIONS:

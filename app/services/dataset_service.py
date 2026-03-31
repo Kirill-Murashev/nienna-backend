@@ -14,7 +14,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from scipy.stats import t as student_t
 
-from app.services.themes import PROFILE_HERO_INDICATORS, THEME_DEFINITIONS, theme_codes
+from app.services.themes import MODELING_PRESETS, PROFILE_HERO_INDICATORS, THEME_DEFINITIONS, theme_codes
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATASET_PATH = PROJECT_ROOT / "data" / "normalized" / "rosstat" / "data_regions_collection_102_v20260313.parquet"
@@ -163,6 +163,7 @@ class DatasetService:
         )
         return {
             "themes": THEME_DEFINITIONS,
+            "modeling_presets": MODELING_PRESETS,
             "sections": sections,
             "years": years,
             "regions": [row["object_name"] for row in regions],
@@ -1023,13 +1024,18 @@ class DatasetService:
         response_label: str,
         coefficient_names: list[str],
         compress_year_effects: bool,
+        compress_object_effects: bool = False,
     ) -> str:
         parts = [response_label]
         non_fe_terms: list[str] = []
         year_effects = 0
+        object_effects = 0
         for name in coefficient_names[1:]:
             if compress_year_effects and name.startswith("FE year "):
                 year_effects += 1
+                continue
+            if compress_object_effects and name.startswith("FE object "):
+                object_effects += 1
                 continue
             non_fe_terms.append(name)
         parts.append("= Intercept")
@@ -1037,6 +1043,8 @@ class DatasetService:
             parts.append(f"+ {name}")
         if year_effects:
             parts.append(f"+ {year_effects} year FE")
+        if object_effects:
+            parts.append(f"+ {object_effects} object FE")
         return " ".join(parts)
 
     def _build_model_interpretation(
@@ -1051,11 +1059,13 @@ class DatasetService:
         response_label = interpretation_context.get("response_label", "показатель")
         analysis_type = interpretation_context.get("analysis_type", "model")
         include_year_fixed_effects = bool(interpretation_context.get("include_year_fixed_effects"))
+        include_object_fixed_effects = bool(interpretation_context.get("include_object_fixed_effects"))
         significant = [
             item
             for item in coefficients
             if item["name"] != "Intercept"
             and not str(item["name"]).startswith("FE year ")
+            and not str(item["name"]).startswith("FE object ")
             and item["p_value"] is not None
             and item["p_value"] <= 0.05
         ]
@@ -1089,6 +1099,11 @@ class DatasetService:
         ]
         if include_year_fixed_effects:
             bullets.append("В модели включены year fixed effects, поэтому сравнение очищено от общих межгодовых сдвигов.")
+        if include_object_fixed_effects:
+            bullets.append("В модели включены object fixed effects, поэтому сравнение очищено от постоянных различий между регионами.")
+        lags = interpretation_context.get("lag_summary", [])
+        if lags:
+            bullets.append(f"Использованы лаги факторов: {', '.join(lags)}.")
         if analysis_type == "correlation":
             transforms = interpretation_context.get("transforms", {})
             bullets.append(
@@ -1134,8 +1149,35 @@ class DatasetService:
         dependent_indicator: dict[str, Any],
         predictor_indicators: list[dict[str, Any]],
         include_year_fixed_effects: bool,
+        include_object_fixed_effects: bool,
     ) -> dict[str, Any]:
-        predictors = predictor_indicators[:5]
+        def serialize_predictor(item: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "code": item["code"],
+                "subsection": item.get("subsection"),
+                "transform": item.get("transform", "raw"),
+                "lag_years": int(item.get("lag_years", 0) or 0),
+            }
+
+        predictors: list[dict[str, Any]] = []
+        seen_predictors: set[tuple[str, str, int]] = set()
+        for item in predictor_indicators:
+            key = (
+                str(item.get("code", "")),
+                str(item.get("transform", "raw")),
+                int(item.get("lag_years", 0) or 0),
+            )
+            if not key[0] or key[0] == dependent_indicator["code"] or key in seen_predictors:
+                continue
+            seen_predictors.add(key)
+            predictors.append(
+                {
+                    **item,
+                    "model_key": f"{key[0]}::{key[1]}::{key[2]}",
+                }
+            )
+            if len(predictors) >= 5:
+                break
         dependent_rows = self._fetch_indicator_panel_rows(
             dependent_indicator,
             object_level=object_level,
@@ -1171,20 +1213,22 @@ class DatasetService:
         dropped_non_positive = 0
         for predictor in predictors:
             code = predictor["code"]
+            model_key = predictor["model_key"]
             rows = predictor_rows_by_code.get(code, [])
             predictor_map: dict[tuple[str, int], float] = {}
+            lag_years = int(predictor.get("lag_years", 0) or 0)
             for row in rows:
                 transformed_value = self._apply_transform(float(row["indicator_value"]), predictor.get("transform", "raw"))
                 if transformed_value is None:
                     dropped_non_positive += 1
                     continue
-                predictor_map[(str(row["object_name"]), int(row["year"]))] = transformed_value
+                predictor_map[(str(row["object_name"]), int(row["year"]) + lag_years)] = transformed_value
             for key in list(panel_map):
                 value = predictor_map.get(key)
                 if value is None:
                     panel_map.pop(key, None)
                     continue
-                panel_map[key]["predictors"][code] = value
+                panel_map[key]["predictors"][model_key] = value
 
         panel_rows = sorted(panel_map.values(), key=lambda item: (item["year"], item["object_name"]))
         if not panel_rows or not predictors:
@@ -1193,8 +1237,9 @@ class DatasetService:
                 "year_from": year_from,
                 "year_to": year_to,
                 "dependent_indicator": dependent_indicator,
-                "predictor_indicators": predictors,
+                "predictor_indicators": [serialize_predictor(item) for item in predictors],
                 "include_year_fixed_effects": include_year_fixed_effects,
+                "include_object_fixed_effects": include_object_fixed_effects,
                 "observations_count": 0,
                 "years": [],
                 "regression": {
@@ -1215,23 +1260,29 @@ class DatasetService:
             }
 
         years = sorted({int(item["year"]) for item in panel_rows})
+        objects = sorted({str(item["object_name"]) for item in panel_rows})
         baseline_year = years[0]
+        baseline_object = objects[0]
         coefficient_names = ["Intercept"]
         coefficient_names.extend(
-            f"{item['code']} ({item.get('transform', 'raw')})"
+            f"{item['code']} ({item.get('transform', 'raw')}, lag={int(item.get('lag_years', 0) or 0)})"
             for item in predictors
         )
         if include_year_fixed_effects:
             coefficient_names.extend(f"FE year {year}" for year in years[1:])
+        if include_object_fixed_effects:
+            coefficient_names.extend(f"FE object {object_name}" for object_name in objects[1:])
 
         design_matrix: list[list[float]] = []
         targets: list[float] = []
         for item in panel_rows:
             row = [1.0]
             for predictor in predictors:
-                row.append(float(item["predictors"][predictor["code"]]))
+                row.append(float(item["predictors"][predictor["model_key"]]))
             if include_year_fixed_effects:
                 row.extend(1.0 if item["year"] == year else 0.0 for year in years[1:])
+            if include_object_fixed_effects:
+                row.extend(1.0 if item["object_name"] == object_name else 0.0 for object_name in objects[1:])
             design_matrix.append(row)
             targets.append(float(item["dependent_value"]))
 
@@ -1244,6 +1295,7 @@ class DatasetService:
                 response_label=f"{dependent_indicator['code']} ({dependent_indicator.get('transform', 'raw')})",
                 coefficient_names=coefficient_names,
                 compress_year_effects=True,
+                compress_object_effects=True,
             ),
             interpretation_context={
                 "model": "multi_linear",
@@ -1251,17 +1303,24 @@ class DatasetService:
                 "response_label": dependent_indicator["code"],
                 "predictor_labels": [item["code"] for item in predictors],
                 "include_year_fixed_effects": include_year_fixed_effects,
+                "include_object_fixed_effects": include_object_fixed_effects,
+                "lag_summary": [
+                    f"{item['code']}@t-{int(item.get('lag_years', 0) or 0)}"
+                    for item in predictors
+                    if int(item.get("lag_years", 0) or 0) > 0
+                ],
                 "analysis_type": "multifactor",
             },
         )
 
         predictor_summaries = []
         for predictor in predictors:
-            values = [float(item["predictors"][predictor["code"]]) for item in panel_rows]
+            values = [float(item["predictors"][predictor["model_key"]]) for item in panel_rows]
             predictor_summaries.append(
                 {
                     "code": predictor["code"],
                     "transform": predictor.get("transform", "raw"),
+                    "lag_years": int(predictor.get("lag_years", 0) or 0),
                     "avg": float(sum(values) / len(values)) if values else None,
                     "min": float(min(values)) if values else None,
                     "max": float(max(values)) if values else None,
@@ -1273,11 +1332,13 @@ class DatasetService:
             "year_from": year_from,
             "year_to": year_to,
             "dependent_indicator": dependent_indicator,
-            "predictor_indicators": predictors,
+            "predictor_indicators": [serialize_predictor(item) for item in predictors],
             "include_year_fixed_effects": include_year_fixed_effects,
+            "include_object_fixed_effects": include_object_fixed_effects,
             "observations_count": len(panel_rows),
             "years": years,
             "baseline_year": baseline_year,
+            "baseline_object": baseline_object,
             "regression": regression,
             "predictor_summaries": predictor_summaries,
         }

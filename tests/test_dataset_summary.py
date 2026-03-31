@@ -90,10 +90,11 @@ def test_multi_regression_smoke() -> None:
             "year_to": 2024,
             "dependent_indicator": {"code": "Y477110374", "transform": "log"},
             "predictor_indicators": [
-                {"code": "Y477110108", "transform": "log"},
-                {"code": "Y477110461", "transform": "log"},
+                {"code": "Y477110108", "transform": "log", "lag_years": 1},
+                {"code": "Y477110461", "transform": "log", "lag_years": 0},
             ],
             "include_year_fixed_effects": True,
+            "include_object_fixed_effects": True,
         },
     )
     assert response.status_code == 200
@@ -102,6 +103,7 @@ def test_multi_regression_smoke() -> None:
     assert payload["regression"]["observations_count"] > 0
     assert payload["regression"]["coefficients"]
     assert payload["regression"]["interpretation"]["headline"]
+    assert payload["include_object_fixed_effects"] is True
 
 
 def test_report_pdf_smoke() -> None:

@@ -43,6 +43,7 @@ class ModelingIndicatorPayload(BaseModel):
     code: str
     subsection: str | None = None
     transform: str = "raw"
+    lag_years: int = 0
 
 
 class MultiRegressionPayload(BaseModel):
@@ -52,6 +53,7 @@ class MultiRegressionPayload(BaseModel):
     dependent_indicator: ModelingIndicatorPayload
     predictor_indicators: list[ModelingIndicatorPayload] = Field(default_factory=list)
     include_year_fixed_effects: bool = False
+    include_object_fixed_effects: bool = False
 
 
 class ReportStoryCardPayload(BaseModel):
@@ -217,6 +219,7 @@ def get_multi_regression_model(
         dependent_indicator=payload.dependent_indicator.model_dump(),
         predictor_indicators=[item.model_dump() for item in payload.predictor_indicators],
         include_year_fixed_effects=payload.include_year_fixed_effects,
+        include_object_fixed_effects=payload.include_object_fixed_effects,
     )
 
 
