@@ -80,6 +80,30 @@ def test_report_brief_smoke() -> None:
     assert "Smoke Memo" in payload["markdown"]
 
 
+def test_multi_regression_smoke() -> None:
+    client = TestClient(app)
+    response = client.post(
+        "/api/v1/nienna/modeling/regression",
+        json={
+            "object_level": "Регион",
+            "year_from": 2020,
+            "year_to": 2024,
+            "dependent_indicator": {"code": "Y477110374", "transform": "log"},
+            "predictor_indicators": [
+                {"code": "Y477110108", "transform": "log"},
+                {"code": "Y477110461", "transform": "log"},
+            ],
+            "include_year_fixed_effects": True,
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["observations_count"] > 0
+    assert payload["regression"]["observations_count"] > 0
+    assert payload["regression"]["coefficients"]
+    assert payload["regression"]["interpretation"]["headline"]
+
+
 def test_report_pdf_smoke() -> None:
     client = TestClient(app)
     response = client.post(

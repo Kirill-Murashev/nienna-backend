@@ -39,6 +39,21 @@ class CorrelationLabPayload(BaseModel):
     regression_model: str = "linear"
 
 
+class ModelingIndicatorPayload(BaseModel):
+    code: str
+    subsection: str | None = None
+    transform: str = "raw"
+
+
+class MultiRegressionPayload(BaseModel):
+    object_level: str = "Регион"
+    year_from: int
+    year_to: int
+    dependent_indicator: ModelingIndicatorPayload
+    predictor_indicators: list[ModelingIndicatorPayload] = Field(default_factory=list)
+    include_year_fixed_effects: bool = False
+
+
 class ReportStoryCardPayload(BaseModel):
     kind: str
     title: str
@@ -187,6 +202,21 @@ def get_correlation_lab(
         x_transform=payload.x_transform,
         y_transform=payload.y_transform,
         regression_model=payload.regression_model,
+    )
+
+
+@router.post("/modeling/regression")
+def get_multi_regression_model(
+    payload: MultiRegressionPayload,
+    service: DatasetService = Depends(get_dataset_service),
+) -> dict[str, Any]:
+    return service.get_multi_regression_model(
+        object_level=payload.object_level,
+        year_from=payload.year_from,
+        year_to=payload.year_to,
+        dependent_indicator=payload.dependent_indicator.model_dump(),
+        predictor_indicators=[item.model_dump() for item in payload.predictor_indicators],
+        include_year_fixed_effects=payload.include_year_fixed_effects,
     )
 
 

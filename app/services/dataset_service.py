@@ -751,7 +751,12 @@ class DatasetService:
             )
 
         transformed_summary = self._summarize_transformed_points(transformed_points)
-        regression = self._fit_regression(points, regression_model)
+        regression = self._fit_regression(
+            points,
+            regression_model=regression_model,
+            x_transform=x_transform,
+            y_transform=y_transform,
+        )
 
         strongest_positive = sorted(
             transformed_points,
@@ -808,20 +813,39 @@ class DatasetService:
             "y_avg": y_avg,
         }
 
-    def _fit_regression(self, points: list[dict[str, Any]], regression_model: str) -> dict[str, Any]:
-        model_points, design_matrix, targets, predictor_labels, equation_template = self._prepare_regression_inputs(
-            points, regression_model
-        )
-        if len(model_points) < len(predictor_labels) + 2:
+    def _apply_transform(self, value: float, transform: str) -> float | None:
+        if transform == "log":
+            if value <= 0:
+                return None
+            return math.log10(value)
+        return value
+
+    def _fit_ols_model(
+        self,
+        *,
+        row_meta: list[dict[str, Any]],
+        design_matrix: list[list[float]],
+        targets: list[float],
+        coefficient_names: list[str],
+        equation_label: str,
+        interpretation_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        if len(targets) < len(coefficient_names) + 1:
             return {
-                "model": regression_model,
-                "observations_count": len(model_points),
-                "dropped_non_positive": len(points) - len(model_points),
+                "model": interpretation_context.get("model", "linear"),
+                "observations_count": len(targets),
+                "dropped_non_positive": interpretation_context.get("dropped_non_positive", 0),
                 "coefficients": [],
                 "r_squared": None,
                 "adjusted_r_squared": None,
-                "equation": None,
+                "equation": equation_label if targets else None,
                 "residuals": [],
+                "interpretation": {
+                    "headline": "Недостаточно наблюдений для устойчивой оценки модели.",
+                    "bullets": [
+                        "Попробуйте сократить число факторов или расширить временной интервал.",
+                    ],
+                },
             }
 
         x_matrix = np.asarray(design_matrix, dtype=float)
@@ -844,7 +868,6 @@ class DatasetService:
         standard_errors = np.sqrt(np.diag(covariance))
         critical_t = float(student_t.ppf(0.975, df)) if df > 0 else 0.0
 
-        coefficient_names = ["Intercept", *predictor_labels]
         coefficients: list[dict[str, Any]] = []
         for index, name in enumerate(coefficient_names):
             estimate = float(beta[index])
@@ -867,11 +890,12 @@ class DatasetService:
 
         residuals = []
         for item, actual, predicted_value, residual in zip(
-            model_points, y_vector.tolist(), predicted.tolist(), residuals_vector.tolist(), strict=False
+            row_meta, y_vector.tolist(), predicted.tolist(), residuals_vector.tolist(), strict=False
         ):
             residuals.append(
                 {
-                    "object_name": item["object_name"],
+                    "object_name": item.get("object_name", "—"),
+                    "year": item.get("year"),
                     "predicted_y": predicted_value,
                     "actual_y": actual,
                     "residual": residual,
@@ -879,67 +903,384 @@ class DatasetService:
             )
 
         return {
-            "model": regression_model,
-            "observations_count": len(model_points),
-            "dropped_non_positive": len(points) - len(model_points),
+            "model": interpretation_context.get("model", "linear"),
+            "observations_count": len(targets),
+            "dropped_non_positive": interpretation_context.get("dropped_non_positive", 0),
             "coefficients": coefficients,
             "r_squared": r_squared,
             "adjusted_r_squared": adjusted_r_squared,
-            "equation": equation_template(coefficients),
+            "equation": equation_label,
             "residuals": sorted(residuals, key=lambda item: abs(item["residual"]), reverse=True)[:12],
+            "interpretation": self._build_model_interpretation(
+                coefficients=coefficients,
+                r_squared=r_squared,
+                adjusted_r_squared=adjusted_r_squared,
+                observations_count=len(targets),
+                interpretation_context=interpretation_context,
+            ),
         }
 
+    def _fit_regression(
+        self,
+        points: list[dict[str, Any]],
+        regression_model: str,
+        x_transform: str,
+        y_transform: str,
+    ) -> dict[str, Any]:
+        model_points, design_matrix, targets, predictor_labels = self._prepare_regression_inputs(
+            points,
+            regression_model=regression_model,
+            x_transform=x_transform,
+            y_transform=y_transform,
+        )
+        equation_label = self._build_equation_label(
+            response_label="y",
+            coefficient_names=["Intercept", *predictor_labels],
+            compress_year_effects=False,
+        )
+        return self._fit_ols_model(
+            row_meta=model_points,
+            design_matrix=design_matrix,
+            targets=targets,
+            coefficient_names=["Intercept", *predictor_labels],
+            equation_label=equation_label,
+            interpretation_context={
+                "model": regression_model,
+                "dropped_non_positive": len(points) - len(model_points),
+                "response_label": "Y",
+                "predictor_labels": predictor_labels,
+                "include_year_fixed_effects": False,
+                "transforms": {"x": x_transform, "y": y_transform},
+                "analysis_type": "correlation",
+            },
+        )
+
     def _prepare_regression_inputs(
-        self, points: list[dict[str, Any]], regression_model: str
+        self,
+        points: list[dict[str, Any]],
+        regression_model: str,
+        x_transform: str,
+        y_transform: str,
     ) -> tuple[list[dict[str, Any]], list[list[float]], list[float], list[str], Any]:
         prepared_points: list[dict[str, Any]] = []
         rows: list[list[float]] = []
         targets: list[float] = []
+        predictor_labels: list[str] = []
 
         for item in points:
-            x_value = float(item["x_value"])
-            y_value = float(item["y_value"])
+            original_x_value = float(item["x_value"])
+            original_y_value = float(item["y_value"])
+            x_value = self._apply_transform(original_x_value, x_transform)
+            y_value = self._apply_transform(original_y_value, y_transform)
+            if x_value is None or y_value is None:
+                continue
             if regression_model == "linear":
                 features = [x_value]
                 target = y_value
                 predictor_labels = ["x"]
-                equation_template = lambda coeffs: f"y = {coeffs[0]['estimate']:.4f} + {coeffs[1]['estimate']:.4f} * x"
             elif regression_model == "quadratic":
                 features = [x_value, x_value**2]
                 target = y_value
                 predictor_labels = ["x", "x^2"]
-                equation_template = (
-                    lambda coeffs: f"y = {coeffs[0]['estimate']:.4f} + {coeffs[1]['estimate']:.4f} * x + {coeffs[2]['estimate']:.4f} * x^2"
-                )
             elif regression_model == "exponential":
-                if y_value <= 0:
-                    continue
                 features = [x_value]
-                target = math.log(y_value)
-                predictor_labels = ["x"]
-                equation_template = (
-                    lambda coeffs: f"ln(y) = {coeffs[0]['estimate']:.4f} + {coeffs[1]['estimate']:.4f} * x"
-                )
-            elif regression_model == "power":
-                if x_value <= 0 or y_value <= 0:
+                if y_transform == "log":
+                    target = y_value
+                elif original_y_value <= 0:
                     continue
-                features = [math.log(x_value)]
-                target = math.log(y_value)
+                else:
+                    target = math.log(original_y_value)
+                predictor_labels = ["x"]
+            elif regression_model == "power":
+                if x_transform == "log":
+                    transformed_x = x_value
+                elif original_x_value <= 0:
+                    continue
+                else:
+                    transformed_x = math.log(original_x_value)
+                if y_transform == "log":
+                    target = y_value
+                elif original_y_value <= 0:
+                    continue
+                else:
+                    target = math.log(original_y_value)
+                features = [transformed_x]
                 predictor_labels = ["ln(x)"]
-                equation_template = (
-                    lambda coeffs: f"ln(y) = {coeffs[0]['estimate']:.4f} + {coeffs[1]['estimate']:.4f} * ln(x)"
-                )
             else:
                 features = [x_value]
                 target = y_value
                 predictor_labels = ["x"]
-                equation_template = lambda coeffs: f"y = {coeffs[0]['estimate']:.4f} + {coeffs[1]['estimate']:.4f} * x"
 
             prepared_points.append(item)
             rows.append([1.0, *features])
             targets.append(target)
 
-        return prepared_points, rows, targets, predictor_labels, equation_template
+        return prepared_points, rows, targets, predictor_labels
+
+    def _build_equation_label(
+        self,
+        *,
+        response_label: str,
+        coefficient_names: list[str],
+        compress_year_effects: bool,
+    ) -> str:
+        parts = [response_label]
+        non_fe_terms: list[str] = []
+        year_effects = 0
+        for name in coefficient_names[1:]:
+            if compress_year_effects and name.startswith("FE year "):
+                year_effects += 1
+                continue
+            non_fe_terms.append(name)
+        parts.append("= Intercept")
+        for name in non_fe_terms:
+            parts.append(f"+ {name}")
+        if year_effects:
+            parts.append(f"+ {year_effects} year FE")
+        return " ".join(parts)
+
+    def _build_model_interpretation(
+        self,
+        *,
+        coefficients: list[dict[str, Any]],
+        r_squared: float | None,
+        adjusted_r_squared: float | None,
+        observations_count: int,
+        interpretation_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        response_label = interpretation_context.get("response_label", "показатель")
+        analysis_type = interpretation_context.get("analysis_type", "model")
+        include_year_fixed_effects = bool(interpretation_context.get("include_year_fixed_effects"))
+        significant = [
+            item
+            for item in coefficients
+            if item["name"] != "Intercept"
+            and not str(item["name"]).startswith("FE year ")
+            and item["p_value"] is not None
+            and item["p_value"] <= 0.05
+        ]
+        if adjusted_r_squared is None:
+            fit_label = "не даёт устойчивого качества подгонки"
+        elif adjusted_r_squared >= 0.65:
+            fit_label = "хорошо объясняет различия в данных"
+        elif adjusted_r_squared >= 0.35:
+            fit_label = "объясняет заметную часть различий, но оставляет много необъяснённого"
+        else:
+            fit_label = "объясняет лишь небольшую часть различий"
+
+        if significant:
+            top = sorted(significant, key=lambda item: abs(item["t_stat"] or 0), reverse=True)[:3]
+            driver_parts = []
+            for item in top:
+                direction = "рост" if (item["estimate"] or 0) > 0 else "снижение"
+                driver_parts.append(f"{item['name']} показывает {direction} {response_label} (p={item['p_value']:.3f})")
+            drivers_text = "; ".join(driver_parts)
+        else:
+            drivers_text = "статистически значимых драйверов на уровне 5% не найдено"
+
+        headline = (
+            f"Модель для {response_label} {fit_label}. "
+            f"В выборке {observations_count} наблюдений."
+        )
+        bullets = [
+            f"Adjusted R²: {adjusted_r_squared:.3f}" if adjusted_r_squared is not None else "Adjusted R² не определён.",
+            f"R²: {r_squared:.3f}" if r_squared is not None else "R² не определён.",
+            drivers_text[0].upper() + drivers_text[1:] if drivers_text else "Интерпретация драйверов недоступна.",
+        ]
+        if include_year_fixed_effects:
+            bullets.append("В модели включены year fixed effects, поэтому сравнение очищено от общих межгодовых сдвигов.")
+        if analysis_type == "correlation":
+            transforms = interpretation_context.get("transforms", {})
+            bullets.append(
+                f"Для корреляционного режима использованы transforms X={transforms.get('x', 'raw')} и Y={transforms.get('y', 'raw')}."
+            )
+        return {"headline": headline, "bullets": bullets}
+
+    def _fetch_indicator_panel_rows(
+        self,
+        indicator: dict[str, Any],
+        object_level: str,
+        year_from: int,
+        year_to: int,
+    ) -> list[dict[str, Any]]:
+        filters = ["indicator_code = ?", "object_level = ?", "year >= ?", "year <= ?"]
+        params: list[Any] = [indicator["code"], object_level, year_from, year_to]
+        if indicator.get("subsection"):
+            filters.append("subsection = ?")
+            params.append(indicator["subsection"])
+        return self._query(
+            f"""
+            SELECT
+              object_name,
+              year,
+              indicator_name,
+              subsection,
+              indicator_value,
+              indicator_unit
+            FROM observations
+            WHERE {' AND '.join(filters)}
+              AND indicator_value NOT IN ({MISSING_VALUE_SENTINELS[0]}, {MISSING_VALUE_SENTINELS[1]})
+            ORDER BY year, object_name
+            """,
+            params,
+        )
+
+    def get_multi_regression_model(
+        self,
+        *,
+        object_level: str,
+        year_from: int,
+        year_to: int,
+        dependent_indicator: dict[str, Any],
+        predictor_indicators: list[dict[str, Any]],
+        include_year_fixed_effects: bool,
+    ) -> dict[str, Any]:
+        predictors = predictor_indicators[:5]
+        dependent_rows = self._fetch_indicator_panel_rows(
+            dependent_indicator,
+            object_level=object_level,
+            year_from=year_from,
+            year_to=year_to,
+        )
+        predictor_rows_by_code = {
+            item["code"]: self._fetch_indicator_panel_rows(
+                item,
+                object_level=object_level,
+                year_from=year_from,
+                year_to=year_to,
+            )
+            for item in predictors
+        }
+
+        panel_map: dict[tuple[str, int], dict[str, Any]] = {}
+        for row in dependent_rows:
+            key = (str(row["object_name"]), int(row["year"]))
+            transformed_value = self._apply_transform(float(row["indicator_value"]), dependent_indicator.get("transform", "raw"))
+            if transformed_value is None:
+                continue
+            panel_map[key] = {
+                "object_name": row["object_name"],
+                "year": row["year"],
+                "dependent_value": transformed_value,
+                "dependent_raw_value": float(row["indicator_value"]),
+                "dependent_indicator_name": row["indicator_name"],
+                "dependent_unit": row["indicator_unit"],
+                "predictors": {},
+            }
+
+        dropped_non_positive = 0
+        for predictor in predictors:
+            code = predictor["code"]
+            rows = predictor_rows_by_code.get(code, [])
+            predictor_map: dict[tuple[str, int], float] = {}
+            for row in rows:
+                transformed_value = self._apply_transform(float(row["indicator_value"]), predictor.get("transform", "raw"))
+                if transformed_value is None:
+                    dropped_non_positive += 1
+                    continue
+                predictor_map[(str(row["object_name"]), int(row["year"]))] = transformed_value
+            for key in list(panel_map):
+                value = predictor_map.get(key)
+                if value is None:
+                    panel_map.pop(key, None)
+                    continue
+                panel_map[key]["predictors"][code] = value
+
+        panel_rows = sorted(panel_map.values(), key=lambda item: (item["year"], item["object_name"]))
+        if not panel_rows or not predictors:
+            return {
+                "object_level": object_level,
+                "year_from": year_from,
+                "year_to": year_to,
+                "dependent_indicator": dependent_indicator,
+                "predictor_indicators": predictors,
+                "include_year_fixed_effects": include_year_fixed_effects,
+                "observations_count": 0,
+                "years": [],
+                "regression": {
+                    "model": "multi_linear",
+                    "observations_count": 0,
+                    "dropped_non_positive": dropped_non_positive,
+                    "coefficients": [],
+                    "r_squared": None,
+                    "adjusted_r_squared": None,
+                    "equation": None,
+                    "residuals": [],
+                    "interpretation": {
+                        "headline": "Недостаточно данных для multi-factor модели.",
+                        "bullets": ["Выберите зависимую переменную и хотя бы один фактор с достаточным покрытием."],
+                    },
+                },
+                "predictor_summaries": [],
+            }
+
+        years = sorted({int(item["year"]) for item in panel_rows})
+        baseline_year = years[0]
+        coefficient_names = ["Intercept"]
+        coefficient_names.extend(
+            f"{item['code']} ({item.get('transform', 'raw')})"
+            for item in predictors
+        )
+        if include_year_fixed_effects:
+            coefficient_names.extend(f"FE year {year}" for year in years[1:])
+
+        design_matrix: list[list[float]] = []
+        targets: list[float] = []
+        for item in panel_rows:
+            row = [1.0]
+            for predictor in predictors:
+                row.append(float(item["predictors"][predictor["code"]]))
+            if include_year_fixed_effects:
+                row.extend(1.0 if item["year"] == year else 0.0 for year in years[1:])
+            design_matrix.append(row)
+            targets.append(float(item["dependent_value"]))
+
+        regression = self._fit_ols_model(
+            row_meta=panel_rows,
+            design_matrix=design_matrix,
+            targets=targets,
+            coefficient_names=coefficient_names,
+            equation_label=self._build_equation_label(
+                response_label=f"{dependent_indicator['code']} ({dependent_indicator.get('transform', 'raw')})",
+                coefficient_names=coefficient_names,
+                compress_year_effects=True,
+            ),
+            interpretation_context={
+                "model": "multi_linear",
+                "dropped_non_positive": dropped_non_positive,
+                "response_label": dependent_indicator["code"],
+                "predictor_labels": [item["code"] for item in predictors],
+                "include_year_fixed_effects": include_year_fixed_effects,
+                "analysis_type": "multifactor",
+            },
+        )
+
+        predictor_summaries = []
+        for predictor in predictors:
+            values = [float(item["predictors"][predictor["code"]]) for item in panel_rows]
+            predictor_summaries.append(
+                {
+                    "code": predictor["code"],
+                    "transform": predictor.get("transform", "raw"),
+                    "avg": float(sum(values) / len(values)) if values else None,
+                    "min": float(min(values)) if values else None,
+                    "max": float(max(values)) if values else None,
+                }
+            )
+
+        return {
+            "object_level": object_level,
+            "year_from": year_from,
+            "year_to": year_to,
+            "dependent_indicator": dependent_indicator,
+            "predictor_indicators": predictors,
+            "include_year_fixed_effects": include_year_fixed_effects,
+            "observations_count": len(panel_rows),
+            "years": years,
+            "baseline_year": baseline_year,
+            "regression": regression,
+            "predictor_summaries": predictor_summaries,
+        }
 
     def build_report_brief(
         self,
