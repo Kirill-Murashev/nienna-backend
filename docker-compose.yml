@@ -1,0 +1,10 @@
+services:
+  nienna-backend:
+    build:
+      context: .
+    container_name: nienna-backend
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8014:8014"
+    volumes:
+      - ./data:/srv/app/data
