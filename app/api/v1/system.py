@@ -12,8 +12,10 @@ def get_meta() -> dict[str, object]:
         "display_name": "Nienna",
         "capabilities": [
             "rosstat-regional-dataset",
-            "dataset-schema-overview",
-            "sample-record-preview",
+            "indicator-explorer",
+            "region-profile",
+            "compare-regions",
+            "theme-dashboards",
         ],
-        "status": "bootstrap-ready",
+        "status": "mvp-ready",
     }
