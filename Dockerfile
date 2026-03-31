@@ -11,6 +11,6 @@ COPY data ./data
 
 RUN pip install --no-cache-dir -e .
 
-EXPOSE 8014
+EXPOSE 8015
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8014"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8015"]

@@ -23,7 +23,7 @@
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .[test]
-uvicorn app.main:app --reload --port 8014
+uvicorn app.main:app --reload --port 8015
 ```
 
 ## API
@@ -34,7 +34,7 @@ uvicorn app.main:app --reload --port 8014
 
 ## Production
 - Public API prefix: `https://app.digitalpm.info/api/nienna`
-- Local backend port: `127.0.0.1:8014`
+- Local backend port: `127.0.0.1:8015`
 
 Smoke test after deploy:
 ```bash

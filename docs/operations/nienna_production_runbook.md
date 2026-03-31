@@ -4,14 +4,14 @@
 - Backend repo on server: `/opt/nienna-backend`
 - Public app: `https://app.digitalpm.info`
 - Public API prefix: `https://app.digitalpm.info/api/nienna`
-- Local backend port: `127.0.0.1:8014`
+- Local backend port: `127.0.0.1:8015`
 
 ## Базовые проверки
 ```bash
 cd /opt/nienna-backend
 git status --short
 git rev-parse HEAD
-curl -fsS http://127.0.0.1:8014/healthz
+curl -fsS http://127.0.0.1:8015/healthz
 ./scripts/smoke_test_production.sh
 ```
 
@@ -24,4 +24,4 @@ git pull --ff-only origin main
 ```
 
 ## nginx
-Публичный префикс `/api/nienna/` должен проксироваться на `http://127.0.0.1:8014/`.
+Публичный префикс `/api/nienna/` должен проксироваться на `http://127.0.0.1:8015/`.

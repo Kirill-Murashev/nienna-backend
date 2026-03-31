@@ -5,6 +5,6 @@ services:
     container_name: nienna-backend
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8014:8014"
+      - "127.0.0.1:8015:8015"
     volumes:
       - ./data:/srv/app/data
