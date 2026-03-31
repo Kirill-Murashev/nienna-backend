@@ -54,6 +54,10 @@ class MultiRegressionPayload(BaseModel):
     predictor_indicators: list[ModelingIndicatorPayload] = Field(default_factory=list)
     include_year_fixed_effects: bool = False
     include_object_fixed_effects: bool = False
+    cluster_by: str = "none"
+    include_pairwise_interactions: bool = False
+    event_study_indicator_code: str | None = None
+    event_study_max_lag_years: int = 3
 
 
 class ReportStoryCardPayload(BaseModel):
@@ -220,6 +224,10 @@ def get_multi_regression_model(
         predictor_indicators=[item.model_dump() for item in payload.predictor_indicators],
         include_year_fixed_effects=payload.include_year_fixed_effects,
         include_object_fixed_effects=payload.include_object_fixed_effects,
+        cluster_by=payload.cluster_by,
+        include_pairwise_interactions=payload.include_pairwise_interactions,
+        event_study_indicator_code=payload.event_study_indicator_code,
+        event_study_max_lag_years=payload.event_study_max_lag_years,
     )
 
 

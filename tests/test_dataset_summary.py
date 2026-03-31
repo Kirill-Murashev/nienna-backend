@@ -95,6 +95,10 @@ def test_multi_regression_smoke() -> None:
             ],
             "include_year_fixed_effects": True,
             "include_object_fixed_effects": True,
+            "cluster_by": "object",
+            "include_pairwise_interactions": True,
+            "event_study_indicator_code": "Y477110108",
+            "event_study_max_lag_years": 2,
         },
     )
     assert response.status_code == 200
@@ -104,6 +108,8 @@ def test_multi_regression_smoke() -> None:
     assert payload["regression"]["coefficients"]
     assert payload["regression"]["interpretation"]["headline"]
     assert payload["include_object_fixed_effects"] is True
+    assert payload["regression"]["standard_errors_type"] == "object"
+    assert payload["event_study"]["points"]
 
 
 def test_report_pdf_smoke() -> None:

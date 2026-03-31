@@ -830,12 +830,14 @@ class DatasetService:
         coefficient_names: list[str],
         equation_label: str,
         interpretation_context: dict[str, Any],
+        cluster_by: str = "none",
     ) -> dict[str, Any]:
         if len(targets) < len(coefficient_names) + 1:
             return {
                 "model": interpretation_context.get("model", "linear"),
                 "observations_count": len(targets),
                 "dropped_non_positive": interpretation_context.get("dropped_non_positive", 0),
+                "standard_errors_type": cluster_by,
                 "coefficients": [],
                 "r_squared": None,
                 "adjusted_r_squared": None,
@@ -864,17 +866,27 @@ class DatasetService:
         adjusted_r_squared = (
             1.0 - (1.0 - r_squared) * (n - 1) / df if r_squared is not None and df > 0 else None
         )
-        sigma2 = sse / df if df > 0 else 0.0
-        covariance = sigma2 * xtx_inv
+        covariance, inference_df = self._estimate_covariance(
+            x_matrix=x_matrix,
+            residuals_vector=residuals_vector,
+            xtx_inv=xtx_inv,
+            row_meta=row_meta,
+            fallback_df=df,
+            cluster_by=cluster_by,
+        )
         standard_errors = np.sqrt(np.diag(covariance))
-        critical_t = float(student_t.ppf(0.975, df)) if df > 0 else 0.0
+        critical_t = float(student_t.ppf(0.975, inference_df)) if inference_df > 0 else 0.0
 
         coefficients: list[dict[str, Any]] = []
         for index, name in enumerate(coefficient_names):
             estimate = float(beta[index])
             se = float(standard_errors[index]) if index < len(standard_errors) else 0.0
             t_stat = estimate / se if se > 0 else None
-            p_value = float(2 * (1 - student_t.cdf(abs(t_stat), df))) if t_stat is not None and df > 0 else None
+            p_value = (
+                float(2 * (1 - student_t.cdf(abs(t_stat), inference_df)))
+                if t_stat is not None and inference_df > 0
+                else None
+            )
             ci_low = estimate - critical_t * se
             ci_high = estimate + critical_t * se
             coefficients.append(
@@ -907,6 +919,7 @@ class DatasetService:
             "model": interpretation_context.get("model", "linear"),
             "observations_count": len(targets),
             "dropped_non_positive": interpretation_context.get("dropped_non_positive", 0),
+            "standard_errors_type": cluster_by,
             "coefficients": coefficients,
             "r_squared": r_squared,
             "adjusted_r_squared": adjusted_r_squared,
@@ -918,8 +931,45 @@ class DatasetService:
                 adjusted_r_squared=adjusted_r_squared,
                 observations_count=len(targets),
                 interpretation_context=interpretation_context,
+                standard_errors_type=cluster_by,
             ),
         }
+
+    def _estimate_covariance(
+        self,
+        *,
+        x_matrix: np.ndarray,
+        residuals_vector: np.ndarray,
+        xtx_inv: np.ndarray,
+        row_meta: list[dict[str, Any]],
+        fallback_df: int,
+        cluster_by: str,
+    ) -> tuple[np.ndarray, int]:
+        if cluster_by == "none":
+            sigma2 = float(np.sum(residuals_vector**2)) / max(fallback_df, 1)
+            return sigma2 * xtx_inv, fallback_df
+
+        key_name = "object_name" if cluster_by == "object" else "year"
+        groups: dict[str, list[int]] = {}
+        for index, item in enumerate(row_meta):
+            key = str(item.get(key_name, ""))
+            groups.setdefault(key, []).append(index)
+        if len(groups) <= 1:
+            sigma2 = float(np.sum(residuals_vector**2)) / max(fallback_df, 1)
+            return sigma2 * xtx_inv, fallback_df
+
+        meat = np.zeros((x_matrix.shape[1], x_matrix.shape[1]))
+        for indices in groups.values():
+            xg = x_matrix[indices, :]
+            ug = residuals_vector[indices]
+            score = xg.T @ ug
+            meat += np.outer(score, score)
+        g = len(groups)
+        n = x_matrix.shape[0]
+        p = x_matrix.shape[1]
+        correction = (g / max(g - 1, 1)) * ((n - 1) / max(n - p, 1))
+        covariance = correction * (xtx_inv @ meat @ xtx_inv)
+        return covariance, max(g - 1, 1)
 
     def _fit_regression(
         self,
@@ -1055,6 +1105,7 @@ class DatasetService:
         adjusted_r_squared: float | None,
         observations_count: int,
         interpretation_context: dict[str, Any],
+        standard_errors_type: str,
     ) -> dict[str, Any]:
         response_label = interpretation_context.get("response_label", "показатель")
         analysis_type = interpretation_context.get("analysis_type", "model")
@@ -1104,6 +1155,11 @@ class DatasetService:
         lags = interpretation_context.get("lag_summary", [])
         if lags:
             bullets.append(f"Использованы лаги факторов: {', '.join(lags)}.")
+        if standard_errors_type != "none":
+            bullets.append(f"Стандартные ошибки кластеризованы по: {standard_errors_type}.")
+        interactions = interpretation_context.get("interaction_summary", [])
+        if interactions:
+            bullets.append(f"В модели есть взаимодействия факторов: {', '.join(interactions[:3])}.")
         if analysis_type == "correlation":
             transforms = interpretation_context.get("transforms", {})
             bullets.append(
@@ -1150,6 +1206,10 @@ class DatasetService:
         predictor_indicators: list[dict[str, Any]],
         include_year_fixed_effects: bool,
         include_object_fixed_effects: bool,
+        cluster_by: str,
+        include_pairwise_interactions: bool,
+        event_study_indicator_code: str | None,
+        event_study_max_lag_years: int,
     ) -> dict[str, Any]:
         def serialize_predictor(item: dict[str, Any]) -> dict[str, Any]:
             return {
@@ -1240,12 +1300,15 @@ class DatasetService:
                 "predictor_indicators": [serialize_predictor(item) for item in predictors],
                 "include_year_fixed_effects": include_year_fixed_effects,
                 "include_object_fixed_effects": include_object_fixed_effects,
+                "cluster_by": cluster_by,
+                "include_pairwise_interactions": include_pairwise_interactions,
                 "observations_count": 0,
                 "years": [],
                 "regression": {
                     "model": "multi_linear",
                     "observations_count": 0,
                     "dropped_non_positive": dropped_non_positive,
+                    "standard_errors_type": cluster_by,
                     "coefficients": [],
                     "r_squared": None,
                     "adjusted_r_squared": None,
@@ -1257,6 +1320,7 @@ class DatasetService:
                     },
                 },
                 "predictor_summaries": [],
+                "event_study": None,
             }
 
         years = sorted({int(item["year"]) for item in panel_rows})
@@ -1275,6 +1339,12 @@ class DatasetService:
 
         design_matrix: list[list[float]] = []
         targets: list[float] = []
+        interaction_names: list[str] = []
+        if include_pairwise_interactions:
+            for left_index, left in enumerate(predictors):
+                for right in predictors[left_index + 1 :]:
+                    interaction_names.append(f"{left['code']} x {right['code']}")
+            coefficient_names.extend(interaction_names)
         for item in panel_rows:
             row = [1.0]
             for predictor in predictors:
@@ -1283,6 +1353,10 @@ class DatasetService:
                 row.extend(1.0 if item["year"] == year else 0.0 for year in years[1:])
             if include_object_fixed_effects:
                 row.extend(1.0 if item["object_name"] == object_name else 0.0 for object_name in objects[1:])
+            if include_pairwise_interactions:
+                for left_index, left in enumerate(predictors):
+                    for right in predictors[left_index + 1 :]:
+                        row.append(float(item["predictors"][left["model_key"]]) * float(item["predictors"][right["model_key"]]))
             design_matrix.append(row)
             targets.append(float(item["dependent_value"]))
 
@@ -1309,8 +1383,10 @@ class DatasetService:
                     for item in predictors
                     if int(item.get("lag_years", 0) or 0) > 0
                 ],
+                "interaction_summary": interaction_names,
                 "analysis_type": "multifactor",
             },
+            cluster_by=cluster_by,
         )
 
         predictor_summaries = []
@@ -1335,12 +1411,79 @@ class DatasetService:
             "predictor_indicators": [serialize_predictor(item) for item in predictors],
             "include_year_fixed_effects": include_year_fixed_effects,
             "include_object_fixed_effects": include_object_fixed_effects,
+            "cluster_by": cluster_by,
+            "include_pairwise_interactions": include_pairwise_interactions,
             "observations_count": len(panel_rows),
             "years": years,
             "baseline_year": baseline_year,
             "baseline_object": baseline_object,
             "regression": regression,
             "predictor_summaries": predictor_summaries,
+            "event_study": self._build_event_study_profile(
+                panel_rows=panel_rows,
+                predictor_indicators=predictors,
+                event_study_indicator_code=event_study_indicator_code,
+                max_lag_years=event_study_max_lag_years,
+            ),
+        }
+
+    def _build_event_study_profile(
+        self,
+        *,
+        panel_rows: list[dict[str, Any]],
+        predictor_indicators: list[dict[str, Any]],
+        event_study_indicator_code: str | None,
+        max_lag_years: int,
+    ) -> dict[str, Any] | None:
+        if not panel_rows:
+            return None
+        target_code = event_study_indicator_code or predictor_indicators[0]["code"]
+        target_predictor = next((item for item in predictor_indicators if item["code"] == target_code), None)
+        if target_predictor is None:
+            return None
+        model_key = target_predictor["model_key"]
+        panel_by_object: dict[str, dict[int, float]] = {}
+        for row in panel_rows:
+            panel_by_object.setdefault(str(row["object_name"]), {})[int(row["year"])] = float(row["predictors"][model_key])
+        lag_points = []
+        for lag in range(0, max(0, max_lag_years) + 1):
+            xs: list[float] = []
+            ys: list[float] = []
+            for row in panel_rows:
+                object_name = str(row["object_name"])
+                year = int(row["year"])
+                lagged_value = panel_by_object.get(object_name, {}).get(year - lag)
+                if lagged_value is None:
+                    continue
+                xs.append(lagged_value)
+                ys.append(float(row["dependent_value"]))
+            if len(xs) < 3:
+                lag_points.append({"lag_years": lag, "observations_count": len(xs), "correlation": None, "slope": None})
+                continue
+            x_avg = sum(xs) / len(xs)
+            y_avg = sum(ys) / len(ys)
+            sxx = sum((value - x_avg) ** 2 for value in xs)
+            sxy = sum((x - x_avg) * (y - y_avg) for x, y in zip(xs, ys, strict=False))
+            syy = sum((value - y_avg) ** 2 for value in ys)
+            slope = sxy / sxx if sxx > 0 else None
+            correlation = sxy / math.sqrt(sxx * syy) if sxx > 0 and syy > 0 else None
+            lag_points.append(
+                {
+                    "lag_years": lag,
+                    "observations_count": len(xs),
+                    "correlation": correlation,
+                    "slope": slope,
+                }
+            )
+        strongest_lag = max(
+            lag_points,
+            key=lambda item: abs(item["correlation"]) if item["correlation"] is not None else -1,
+            default=None,
+        )
+        return {
+            "indicator_code": target_code,
+            "points": lag_points,
+            "strongest_lag": strongest_lag,
         }
 
     def build_report_brief(
