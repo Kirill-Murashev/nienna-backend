@@ -861,6 +861,7 @@ class DatasetService:
         p = x_matrix.shape[1]
         df = max(n - p, 1)
         sse = float(np.sum(residuals_vector**2))
+        mse = sse / max(df, 1)
         sst = float(np.sum((y_vector - np.mean(y_vector)) ** 2))
         r_squared = 1.0 - (sse / sst) if sst > 0 else None
         adjusted_r_squared = (
@@ -876,6 +877,7 @@ class DatasetService:
         )
         standard_errors = np.sqrt(np.diag(covariance))
         critical_t = float(student_t.ppf(0.975, inference_df)) if inference_df > 0 else 0.0
+        leverage = np.sum((x_matrix @ xtx_inv) * x_matrix, axis=1)
 
         coefficients: list[dict[str, Any]] = []
         for index, name in enumerate(coefficient_names):
@@ -915,6 +917,44 @@ class DatasetService:
                 }
             )
 
+        influence = []
+        for item, actual, predicted_value, residual, h_ii in zip(
+            row_meta,
+            y_vector.tolist(),
+            predicted.tolist(),
+            residuals_vector.tolist(),
+            leverage.tolist(),
+            strict=False,
+        ):
+            standardized_residual = residual / math.sqrt(max(mse * (1 - h_ii), 1e-12)) if mse > 0 else None
+            cooks_distance = (
+                ((residual**2) / max(p * mse, 1e-12)) * (h_ii / max((1 - h_ii) ** 2, 1e-12))
+                if mse > 0
+                else None
+            )
+            influence.append(
+                {
+                    "object_name": item.get("object_name", "—"),
+                    "year": item.get("year"),
+                    "predicted_y": predicted_value,
+                    "actual_y": actual,
+                    "residual": residual,
+                    "standardized_residual": standardized_residual,
+                    "leverage": h_ii,
+                    "cooks_distance": cooks_distance,
+                }
+            )
+
+        diagnostics = {
+            "rmse": math.sqrt(mse) if mse >= 0 else None,
+            "mae": float(np.mean(np.abs(residuals_vector))) if len(residuals_vector) else None,
+            "mean_residual": float(np.mean(residuals_vector)) if len(residuals_vector) else None,
+            "residual_std": float(np.std(residuals_vector)) if len(residuals_vector) else None,
+            "max_abs_residual": float(np.max(np.abs(residuals_vector))) if len(residuals_vector) else None,
+            "avg_leverage": float(np.mean(leverage)) if len(leverage) else None,
+            "max_leverage": float(np.max(leverage)) if len(leverage) else None,
+        }
+
         return {
             "model": interpretation_context.get("model", "linear"),
             "observations_count": len(targets),
@@ -925,6 +965,15 @@ class DatasetService:
             "adjusted_r_squared": adjusted_r_squared,
             "equation": equation_label,
             "residuals": sorted(residuals, key=lambda item: abs(item["residual"]), reverse=True)[:12],
+            "influence": sorted(
+                influence,
+                key=lambda item: (
+                    abs(item["cooks_distance"]) if item["cooks_distance"] is not None else 0.0,
+                    abs(item["standardized_residual"]) if item["standardized_residual"] is not None else 0.0,
+                ),
+                reverse=True,
+            )[:12],
+            "diagnostics": diagnostics,
             "interpretation": self._build_model_interpretation(
                 coefficients=coefficients,
                 r_squared=r_squared,
@@ -970,6 +1019,27 @@ class DatasetService:
         correction = (g / max(g - 1, 1)) * ((n - 1) / max(n - p, 1))
         covariance = correction * (xtx_inv @ meat @ xtx_inv)
         return covariance, max(g - 1, 1)
+
+    def _compute_vif(self, x_matrix: np.ndarray, feature_names: list[str]) -> list[dict[str, Any]]:
+        if x_matrix.shape[1] <= 2:
+            return []
+        feature_matrix = x_matrix[:, 1:]
+        vif_items: list[dict[str, Any]] = []
+        for index, name in enumerate(feature_names):
+            y = feature_matrix[:, index]
+            others = np.delete(feature_matrix, index, axis=1)
+            if others.shape[1] == 0:
+                vif_items.append({"name": name, "vif": None})
+                continue
+            others_with_intercept = np.column_stack([np.ones(len(y)), others])
+            beta = np.linalg.pinv(others_with_intercept.T @ others_with_intercept) @ others_with_intercept.T @ y
+            predicted = others_with_intercept @ beta
+            sst = float(np.sum((y - np.mean(y)) ** 2))
+            sse = float(np.sum((y - predicted) ** 2))
+            r_squared = 1.0 - (sse / sst) if sst > 0 else None
+            vif = 1.0 / max(1.0 - r_squared, 1e-9) if r_squared is not None else None
+            vif_items.append({"name": name, "vif": vif})
+        return sorted(vif_items, key=lambda item: item["vif"] if item["vif"] is not None else -1, reverse=True)
 
     def _fit_regression(
         self,
@@ -1360,6 +1430,18 @@ class DatasetService:
             design_matrix.append(row)
             targets.append(float(item["dependent_value"]))
 
+        vif_feature_names: list[str] = []
+        vif_column_indices: list[int] = [0]
+        for index, name in enumerate(coefficient_names[1:], start=1):
+            if name.startswith("FE year ") or name.startswith("FE object "):
+                continue
+            vif_feature_names.append(name)
+            vif_column_indices.append(index)
+        vif_items = self._compute_vif(
+            np.asarray(design_matrix, dtype=float)[:, vif_column_indices],
+            vif_feature_names,
+        )
+
         regression = self._fit_ols_model(
             row_meta=panel_rows,
             design_matrix=design_matrix,
@@ -1419,6 +1501,17 @@ class DatasetService:
             "baseline_object": baseline_object,
             "regression": regression,
             "predictor_summaries": predictor_summaries,
+            "collinearity": {
+                "vif_items": vif_items,
+                "high_vif_count": sum(1 for item in vif_items if item["vif"] is not None and item["vif"] >= 10),
+                "warning_level": (
+                    "high"
+                    if any(item["vif"] is not None and item["vif"] >= 10 for item in vif_items)
+                    else "moderate"
+                    if any(item["vif"] is not None and item["vif"] >= 5 for item in vif_items)
+                    else "low"
+                ),
+            },
             "event_study": self._build_event_study_profile(
                 panel_rows=panel_rows,
                 predictor_indicators=predictors,

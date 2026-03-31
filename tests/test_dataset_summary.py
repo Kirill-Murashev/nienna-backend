@@ -110,6 +110,9 @@ def test_multi_regression_smoke() -> None:
     assert payload["include_object_fixed_effects"] is True
     assert payload["regression"]["standard_errors_type"] == "object"
     assert payload["event_study"]["points"]
+    assert payload["regression"]["diagnostics"]["rmse"] is not None
+    assert payload["regression"]["influence"]
+    assert payload["collinearity"]["vif_items"]
 
 
 def test_report_pdf_smoke() -> None:
