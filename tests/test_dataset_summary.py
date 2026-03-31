@@ -78,3 +78,29 @@ def test_report_brief_smoke() -> None:
     payload = response.json()
     assert payload["cards_count"] == 1
     assert "Smoke Memo" in payload["markdown"]
+
+
+def test_report_pdf_smoke() -> None:
+    client = TestClient(app)
+    response = client.post(
+        "/api/v1/nienna/report/pdf",
+        json={
+            "title": "PDF Memo",
+            "saved_views_count": 1,
+            "explorer_normalization": "raw",
+            "dataset_rows": 1969010,
+            "cards": [
+                {
+                    "kind": "indicator",
+                    "title": "PDF Test",
+                    "subtitle": "2024",
+                    "primary": "Primary insight",
+                    "secondary": "Secondary insight",
+                    "notes": ["note"],
+                }
+            ],
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/pdf")
+    assert response.content.startswith(b"%PDF")

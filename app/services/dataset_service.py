@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import io
 import math
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import duckdb
+import numpy as np
 import pyarrow.parquet as pq
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from scipy.stats import t as student_t
 
 from app.services.themes import PROFILE_HERO_INDICATORS, THEME_DEFINITIONS, theme_codes
 
@@ -745,7 +751,7 @@ class DatasetService:
             )
 
         transformed_summary = self._summarize_transformed_points(transformed_points)
-        regression = self._fit_regression(transformed_points, regression_model, x_transform, y_transform)
+        regression = self._fit_regression(points, regression_model)
 
         strongest_positive = sorted(
             transformed_points,
@@ -802,63 +808,138 @@ class DatasetService:
             "y_avg": y_avg,
         }
 
-    def _fit_regression(
-        self,
-        points: list[dict[str, Any]],
-        regression_model: str,
-        x_transform: str,
-        y_transform: str,
-    ) -> dict[str, Any]:
-        if not points:
+    def _fit_regression(self, points: list[dict[str, Any]], regression_model: str) -> dict[str, Any]:
+        model_points, design_matrix, targets, predictor_labels, equation_template = self._prepare_regression_inputs(
+            points, regression_model
+        )
+        if len(model_points) < len(predictor_labels) + 2:
             return {
                 "model": regression_model,
-                "slope": None,
-                "intercept": None,
+                "observations_count": len(model_points),
+                "dropped_non_positive": len(points) - len(model_points),
+                "coefficients": [],
                 "r_squared": None,
+                "adjusted_r_squared": None,
                 "equation": None,
                 "residuals": [],
             }
 
-        xs = [float(item["transformed_x"]) for item in points]
-        ys = [float(item["transformed_y"]) for item in points]
-        x_avg = sum(xs) / len(xs)
-        y_avg = sum(ys) / len(ys)
-        sxx = sum((value - x_avg) ** 2 for value in xs)
-        sxy = sum((x - x_avg) * (y - y_avg) for x, y in zip(xs, ys, strict=False))
-        slope = sxy / sxx if sxx > 0 else 0.0
-        intercept = y_avg - slope * x_avg
+        x_matrix = np.asarray(design_matrix, dtype=float)
+        y_vector = np.asarray(targets, dtype=float)
+        xtx_inv = np.linalg.pinv(x_matrix.T @ x_matrix)
+        beta = xtx_inv @ x_matrix.T @ y_vector
+        predicted = x_matrix @ beta
+        residuals_vector = y_vector - predicted
+        n = len(y_vector)
+        p = x_matrix.shape[1]
+        df = max(n - p, 1)
+        sse = float(np.sum(residuals_vector**2))
+        sst = float(np.sum((y_vector - np.mean(y_vector)) ** 2))
+        r_squared = 1.0 - (sse / sst) if sst > 0 else None
+        adjusted_r_squared = (
+            1.0 - (1.0 - r_squared) * (n - 1) / df if r_squared is not None and df > 0 else None
+        )
+        sigma2 = sse / df if df > 0 else 0.0
+        covariance = sigma2 * xtx_inv
+        standard_errors = np.sqrt(np.diag(covariance))
+        critical_t = float(student_t.ppf(0.975, df)) if df > 0 else 0.0
 
-        residuals: list[dict[str, Any]] = []
-        sse = 0.0
-        sst = sum((value - y_avg) ** 2 for value in ys)
-        for item in points:
-            predicted = intercept + slope * float(item["transformed_x"])
-            residual = float(item["transformed_y"]) - predicted
+        coefficient_names = ["Intercept", *predictor_labels]
+        coefficients: list[dict[str, Any]] = []
+        for index, name in enumerate(coefficient_names):
+            estimate = float(beta[index])
+            se = float(standard_errors[index]) if index < len(standard_errors) else 0.0
+            t_stat = estimate / se if se > 0 else None
+            p_value = float(2 * (1 - student_t.cdf(abs(t_stat), df))) if t_stat is not None and df > 0 else None
+            ci_low = estimate - critical_t * se
+            ci_high = estimate + critical_t * se
+            coefficients.append(
+                {
+                    "name": name,
+                    "estimate": estimate,
+                    "std_error": se,
+                    "t_stat": t_stat,
+                    "p_value": p_value,
+                    "ci_95_low": ci_low,
+                    "ci_95_high": ci_high,
+                }
+            )
+
+        residuals = []
+        for item, actual, predicted_value, residual in zip(
+            model_points, y_vector.tolist(), predicted.tolist(), residuals_vector.tolist(), strict=False
+        ):
             residuals.append(
                 {
                     "object_name": item["object_name"],
-                    "predicted_y": predicted,
-                    "actual_y": float(item["transformed_y"]),
+                    "predicted_y": predicted_value,
+                    "actual_y": actual,
                     "residual": residual,
                 }
             )
-            sse += residual**2
-
-        r_squared = 1.0 - (sse / sst) if sst > 0 else None
-        residuals_sorted = sorted(residuals, key=lambda item: abs(item["residual"]), reverse=True)[:12]
-
-        left = "log10(y)" if y_transform == "log" else "y"
-        right_x = "log10(x)" if x_transform == "log" else "x"
-        equation = f"{left} = {intercept:.4f} + {slope:.4f} * {right_x}"
 
         return {
             "model": regression_model,
-            "slope": slope,
-            "intercept": intercept,
+            "observations_count": len(model_points),
+            "dropped_non_positive": len(points) - len(model_points),
+            "coefficients": coefficients,
             "r_squared": r_squared,
-            "equation": equation,
-            "residuals": residuals_sorted,
+            "adjusted_r_squared": adjusted_r_squared,
+            "equation": equation_template(coefficients),
+            "residuals": sorted(residuals, key=lambda item: abs(item["residual"]), reverse=True)[:12],
         }
+
+    def _prepare_regression_inputs(
+        self, points: list[dict[str, Any]], regression_model: str
+    ) -> tuple[list[dict[str, Any]], list[list[float]], list[float], list[str], Any]:
+        prepared_points: list[dict[str, Any]] = []
+        rows: list[list[float]] = []
+        targets: list[float] = []
+
+        for item in points:
+            x_value = float(item["x_value"])
+            y_value = float(item["y_value"])
+            if regression_model == "linear":
+                features = [x_value]
+                target = y_value
+                predictor_labels = ["x"]
+                equation_template = lambda coeffs: f"y = {coeffs[0]['estimate']:.4f} + {coeffs[1]['estimate']:.4f} * x"
+            elif regression_model == "quadratic":
+                features = [x_value, x_value**2]
+                target = y_value
+                predictor_labels = ["x", "x^2"]
+                equation_template = (
+                    lambda coeffs: f"y = {coeffs[0]['estimate']:.4f} + {coeffs[1]['estimate']:.4f} * x + {coeffs[2]['estimate']:.4f} * x^2"
+                )
+            elif regression_model == "exponential":
+                if y_value <= 0:
+                    continue
+                features = [x_value]
+                target = math.log(y_value)
+                predictor_labels = ["x"]
+                equation_template = (
+                    lambda coeffs: f"ln(y) = {coeffs[0]['estimate']:.4f} + {coeffs[1]['estimate']:.4f} * x"
+                )
+            elif regression_model == "power":
+                if x_value <= 0 or y_value <= 0:
+                    continue
+                features = [math.log(x_value)]
+                target = math.log(y_value)
+                predictor_labels = ["ln(x)"]
+                equation_template = (
+                    lambda coeffs: f"ln(y) = {coeffs[0]['estimate']:.4f} + {coeffs[1]['estimate']:.4f} * ln(x)"
+                )
+            else:
+                features = [x_value]
+                target = y_value
+                predictor_labels = ["x"]
+                equation_template = lambda coeffs: f"y = {coeffs[0]['estimate']:.4f} + {coeffs[1]['estimate']:.4f} * x"
+
+            prepared_points.append(item)
+            rows.append([1.0, *features])
+            targets.append(target)
+
+        return prepared_points, rows, targets, predictor_labels, equation_template
 
     def build_report_brief(
         self,
@@ -910,6 +991,96 @@ class DatasetService:
             "markdown": markdown,
             "summary_lines": summary_lines,
         }
+
+    def build_report_pdf(
+        self,
+        title: str,
+        cards: list[dict[str, Any]],
+        saved_views_count: int,
+        explorer_normalization: str | None,
+        dataset_rows: int | None,
+    ) -> bytes:
+        brief = self.build_report_brief(
+            title=title,
+            cards=cards,
+            saved_views_count=saved_views_count,
+            explorer_normalization=explorer_normalization,
+            dataset_rows=dataset_rows,
+        )
+        buffer = io.BytesIO()
+        pdf = canvas.Canvas(buffer, pagesize=A4)
+        width, height = A4
+
+        pdf.setFillColor(colors.HexColor("#0f172a"))
+        pdf.rect(0, 0, width, height, fill=1, stroke=0)
+        pdf.setFillColor(colors.white)
+        pdf.setFont("Helvetica-Bold", 24)
+        pdf.drawString(48, height - 72, title)
+        pdf.setFont("Helvetica", 12)
+        pdf.drawString(48, height - 98, "Nienna server-rendered analytical memo")
+        pdf.drawString(48, height - 118, f"Cards: {brief['cards_count']} · Saved views: {saved_views_count}")
+        pdf.showPage()
+
+        y = height - 48
+        pdf.setFillColor(colors.black)
+        pdf.setFont("Helvetica-Bold", 18)
+        pdf.drawString(40, y, "Executive Summary")
+        y -= 28
+        pdf.setFont("Helvetica", 10)
+        for line in brief["summary_lines"]:
+            pdf.drawString(44, y, f"- {line}")
+            y -= 16
+
+        y -= 10
+        pdf.setFont("Helvetica-Bold", 16)
+        pdf.drawString(40, y, "Story Mix")
+        y -= 24
+        pdf.setFont("Helvetica", 10)
+        for kind, count in sorted(brief["kind_counts"].items()):
+            pdf.drawString(44, y, f"{kind}: {count}")
+            y -= 16
+
+        for index, card in enumerate(cards, start=1):
+            if y < 120:
+                pdf.showPage()
+                y = height - 48
+            pdf.setFont("Helvetica-Bold", 13)
+            pdf.drawString(40, y, f"{index}. {card.get('title', 'Untitled')}")
+            y -= 16
+            pdf.setFont("Helvetica", 10)
+            lines = [
+                str(card.get("subtitle", "")),
+                f"Key point: {card.get('primary', '')}",
+                f"Support point: {card.get('secondary', '')}",
+                *[f"- {note}" for note in card.get("notes", [])],
+            ]
+            for line in lines:
+                for wrapped in self._wrap_pdf_line(line, 88):
+                    if y < 80:
+                        pdf.showPage()
+                        y = height - 48
+                    pdf.drawString(44, y, wrapped)
+                    y -= 14
+            y -= 10
+
+        pdf.save()
+        return buffer.getvalue()
+
+    def _wrap_pdf_line(self, value: str, width: int) -> list[str]:
+        words = value.split()
+        if not words:
+            return [""]
+        lines: list[str] = []
+        current = words[0]
+        for word in words[1:]:
+            candidate = f"{current} {word}"
+            if len(candidate) <= width:
+                current = candidate
+            else:
+                lines.append(current)
+                current = word
+        lines.append(current)
+        return lines
 
 
 @lru_cache(maxsize=1)

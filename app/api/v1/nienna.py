@@ -2,6 +2,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
+from starlette.responses import Response
 
 from app.services.dataset_service import DatasetService, get_dataset_service
 from app.services.themes import THEME_DEFINITIONS
@@ -200,4 +201,23 @@ def build_report_brief(
         saved_views_count=payload.saved_views_count,
         explorer_normalization=payload.explorer_normalization,
         dataset_rows=payload.dataset_rows,
+    )
+
+
+@router.post("/report/pdf")
+def build_report_pdf(
+    payload: ReportBriefPayload,
+    service: DatasetService = Depends(get_dataset_service),
+) -> Response:
+    pdf_bytes = service.build_report_pdf(
+        title=payload.title,
+        cards=[item.model_dump() for item in payload.cards],
+        saved_views_count=payload.saved_views_count,
+        explorer_normalization=payload.explorer_normalization,
+        dataset_rows=payload.dataset_rows,
+    )
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": 'attachment; filename="nienna-brief.pdf"'},
     )
