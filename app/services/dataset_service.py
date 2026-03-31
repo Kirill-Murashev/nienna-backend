@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -648,6 +649,9 @@ class DatasetService:
         object_level: str,
         x_indicator: dict[str, Any],
         y_indicator: dict[str, Any],
+        x_transform: str,
+        y_transform: str,
+        regression_model: str,
     ) -> dict[str, Any]:
         x_filters = ["indicator_code = ?", "year = ?", "object_level = ?"]
         x_params: list[Any] = [x_indicator["code"], year, object_level]
@@ -719,15 +723,42 @@ class DatasetService:
             x_params + y_params,
         )
 
+        transformed_points: list[dict[str, Any]] = []
+        dropped_non_positive = 0
+        for item in points:
+            x_value = float(item["x_value"])
+            y_value = float(item["y_value"])
+            if x_transform == "log" and x_value <= 0:
+                dropped_non_positive += 1
+                continue
+            if y_transform == "log" and y_value <= 0:
+                dropped_non_positive += 1
+                continue
+            transformed_x = math.log10(x_value) if x_transform == "log" else x_value
+            transformed_y = math.log10(y_value) if y_transform == "log" else y_value
+            transformed_points.append(
+                {
+                    **item,
+                    "transformed_x": transformed_x,
+                    "transformed_y": transformed_y,
+                }
+            )
+
+        transformed_summary = self._summarize_transformed_points(transformed_points)
+        regression = self._fit_regression(transformed_points, regression_model, x_transform, y_transform)
+
         strongest_positive = sorted(
-            points,
-            key=lambda item: (item["x_value"] - (summary.get("x_avg") or 0.0))
-            * (item["y_value"] - (summary.get("y_avg") or 0.0)),
+            transformed_points,
+            key=lambda item: (item["transformed_x"] - (transformed_summary.get("x_avg") or 0.0))
+            * (item["transformed_y"] - (transformed_summary.get("y_avg") or 0.0)),
             reverse=True,
         )[:8]
         strongest_divergence = sorted(
-            points,
-            key=lambda item: abs((item["x_value"] - (summary.get("x_avg") or 0.0)) - (item["y_value"] - (summary.get("y_avg") or 0.0))),
+            transformed_points,
+            key=lambda item: abs(
+                (item["transformed_x"] - (transformed_summary.get("x_avg") or 0.0))
+                - (item["transformed_y"] - (transformed_summary.get("y_avg") or 0.0))
+            ),
             reverse=True,
         )[:8]
 
@@ -735,11 +766,149 @@ class DatasetService:
             "year": year,
             "object_level": object_level,
             "summary": summary,
+            "transformed_summary": transformed_summary,
             "x_indicator": x_indicator,
             "y_indicator": y_indicator,
-            "points": points,
+            "x_transform": x_transform,
+            "y_transform": y_transform,
+            "regression_model": regression_model,
+            "points": transformed_points,
             "strongest_positive": strongest_positive,
             "strongest_divergence": strongest_divergence,
+            "dropped_non_positive": dropped_non_positive,
+            "regression": regression,
+        }
+
+    def _summarize_transformed_points(self, points: list[dict[str, Any]]) -> dict[str, Any]:
+        if not points:
+            return {
+                "observations_count": 0,
+                "pearson_correlation": None,
+                "x_avg": None,
+                "y_avg": None,
+            }
+        xs = [item["transformed_x"] for item in points]
+        ys = [item["transformed_y"] for item in points]
+        x_avg = sum(xs) / len(xs)
+        y_avg = sum(ys) / len(ys)
+        sxx = sum((value - x_avg) ** 2 for value in xs)
+        syy = sum((value - y_avg) ** 2 for value in ys)
+        sxy = sum((x - x_avg) * (y - y_avg) for x, y in zip(xs, ys, strict=False))
+        pearson = sxy / math.sqrt(sxx * syy) if sxx > 0 and syy > 0 else None
+        return {
+            "observations_count": len(points),
+            "pearson_correlation": pearson,
+            "x_avg": x_avg,
+            "y_avg": y_avg,
+        }
+
+    def _fit_regression(
+        self,
+        points: list[dict[str, Any]],
+        regression_model: str,
+        x_transform: str,
+        y_transform: str,
+    ) -> dict[str, Any]:
+        if not points:
+            return {
+                "model": regression_model,
+                "slope": None,
+                "intercept": None,
+                "r_squared": None,
+                "equation": None,
+                "residuals": [],
+            }
+
+        xs = [float(item["transformed_x"]) for item in points]
+        ys = [float(item["transformed_y"]) for item in points]
+        x_avg = sum(xs) / len(xs)
+        y_avg = sum(ys) / len(ys)
+        sxx = sum((value - x_avg) ** 2 for value in xs)
+        sxy = sum((x - x_avg) * (y - y_avg) for x, y in zip(xs, ys, strict=False))
+        slope = sxy / sxx if sxx > 0 else 0.0
+        intercept = y_avg - slope * x_avg
+
+        residuals: list[dict[str, Any]] = []
+        sse = 0.0
+        sst = sum((value - y_avg) ** 2 for value in ys)
+        for item in points:
+            predicted = intercept + slope * float(item["transformed_x"])
+            residual = float(item["transformed_y"]) - predicted
+            residuals.append(
+                {
+                    "object_name": item["object_name"],
+                    "predicted_y": predicted,
+                    "actual_y": float(item["transformed_y"]),
+                    "residual": residual,
+                }
+            )
+            sse += residual**2
+
+        r_squared = 1.0 - (sse / sst) if sst > 0 else None
+        residuals_sorted = sorted(residuals, key=lambda item: abs(item["residual"]), reverse=True)[:12]
+
+        left = "log10(y)" if y_transform == "log" else "y"
+        right_x = "log10(x)" if x_transform == "log" else "x"
+        equation = f"{left} = {intercept:.4f} + {slope:.4f} * {right_x}"
+
+        return {
+            "model": regression_model,
+            "slope": slope,
+            "intercept": intercept,
+            "r_squared": r_squared,
+            "equation": equation,
+            "residuals": residuals_sorted,
+        }
+
+    def build_report_brief(
+        self,
+        title: str,
+        cards: list[dict[str, Any]],
+        saved_views_count: int,
+        explorer_normalization: str | None,
+        dataset_rows: int | None,
+    ) -> dict[str, Any]:
+        kind_counts: dict[str, int] = {}
+        for card in cards:
+            kind = str(card.get("kind") or "other")
+            kind_counts[kind] = kind_counts.get(kind, 0) + 1
+
+        summary_lines = [
+            f"Cards: {len(cards)}",
+            f"Saved views: {saved_views_count}",
+        ]
+        if dataset_rows is not None:
+            summary_lines.append(f"Dataset rows: {dataset_rows}")
+        if explorer_normalization:
+            summary_lines.append(f"Explorer normalization: {explorer_normalization}")
+
+        markdown_parts = [f"# {title}", "", "## Executive Summary", ""]
+        markdown_parts.extend(f"- {line}" for line in summary_lines)
+        markdown_parts.extend(["", "## Story Mix", ""])
+        markdown_parts.extend(f"- {kind}: {count}" for kind, count in sorted(kind_counts.items()))
+        markdown_parts.extend(["", "## Sections", ""])
+
+        for index, card in enumerate(cards, start=1):
+            markdown_parts.extend(
+                [
+                    f"### {index}. {card.get('title', 'Untitled')}",
+                    "",
+                    str(card.get("subtitle", "")),
+                    "",
+                    f"- Key point: {card.get('primary', '')}",
+                    f"- Support point: {card.get('secondary', '')}",
+                    *[f"- {note}" for note in card.get("notes", [])],
+                    "",
+                ]
+            )
+
+        markdown = "\n".join(markdown_parts)
+        return {
+            "title": title,
+            "cards_count": len(cards),
+            "kind_counts": kind_counts,
+            "markdown": markdown,
+            "summary_lines": summary_lines,
         }
 
 

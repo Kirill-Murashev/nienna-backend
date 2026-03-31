@@ -33,6 +33,26 @@ class CorrelationLabPayload(BaseModel):
     object_level: str = "Регион"
     x_indicator: CompareIndicatorPayload
     y_indicator: CompareIndicatorPayload
+    x_transform: str = "raw"
+    y_transform: str = "raw"
+    regression_model: str = "linear"
+
+
+class ReportStoryCardPayload(BaseModel):
+    kind: str
+    title: str
+    subtitle: str
+    primary: str
+    secondary: str
+    notes: list[str] = Field(default_factory=list)
+
+
+class ReportBriefPayload(BaseModel):
+    title: str = "Nienna Analytical Memo"
+    cards: list[ReportStoryCardPayload] = Field(default_factory=list)
+    saved_views_count: int = 0
+    explorer_normalization: str | None = None
+    dataset_rows: int | None = None
 
 
 @router.get("")
@@ -163,4 +183,21 @@ def get_correlation_lab(
         object_level=payload.object_level,
         x_indicator=payload.x_indicator.model_dump(),
         y_indicator=payload.y_indicator.model_dump(),
+        x_transform=payload.x_transform,
+        y_transform=payload.y_transform,
+        regression_model=payload.regression_model,
+    )
+
+
+@router.post("/report/brief")
+def build_report_brief(
+    payload: ReportBriefPayload,
+    service: DatasetService = Depends(get_dataset_service),
+) -> dict[str, Any]:
+    return service.build_report_brief(
+        title=payload.title,
+        cards=[item.model_dump() for item in payload.cards],
+        saved_views_count=payload.saved_views_count,
+        explorer_normalization=payload.explorer_normalization,
+        dataset_rows=payload.dataset_rows,
     )

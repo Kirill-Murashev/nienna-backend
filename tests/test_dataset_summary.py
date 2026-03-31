@@ -41,9 +41,40 @@ def test_correlation_lab_smoke() -> None:
             "object_level": "Регион",
             "x_indicator": {"code": "Y477110108"},
             "y_indicator": {"code": "Y477110374"},
+            "x_transform": "log",
+            "y_transform": "log",
+            "regression_model": "linear",
         },
     )
     assert response.status_code == 200
     payload = response.json()
-    assert payload["summary"]["observations_count"] > 0
+    assert payload["transformed_summary"]["observations_count"] > 0
     assert payload["points"]
+    assert payload["regression"]["r_squared"] is not None
+
+
+def test_report_brief_smoke() -> None:
+    client = TestClient(app)
+    response = client.post(
+        "/api/v1/nienna/report/brief",
+        json={
+            "title": "Smoke Memo",
+            "saved_views_count": 2,
+            "explorer_normalization": "raw",
+            "dataset_rows": 1969010,
+            "cards": [
+                {
+                    "kind": "indicator",
+                    "title": "Инвестиции",
+                    "subtitle": "2024",
+                    "primary": "Высокая концентрация в лидерах",
+                    "secondary": "Разрыв между регионами сохраняется",
+                    "notes": ["Москва лидирует", "Сырьевые регионы выше среднего"],
+                }
+            ],
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["cards_count"] == 1
+    assert "Smoke Memo" in payload["markdown"]
